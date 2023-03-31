@@ -127,3 +127,28 @@ class ConvAttention(hk.Module):
                 out = hk.dropout(hk.next_rng_key(), self.dropout, out)
 
         return out
+    
+
+class Transformer(hk.Module):
+    def __init__(self, dim, img_size, depth, heads, dim_head, mlp_dim, dropout=0.6, last_stage=False):
+        self.dim = dim
+        self.img_size = img_size
+        self.depth = depth
+        self.heads = heads
+        self.dim_head = dim_head
+        self.mlp_dim = mlp_dim
+        self.dropout = dropout
+        self.last_stage = last_stage
+
+    def __call__(self, x, is_training: bool=True):
+        for _ in range(self.depth):
+            y = x
+            x = ConvAttention(self.dim, self.img_size, self.heads, self.dim_head, dropout=self.dropout, last_stage=self.last_stage)(x, is_training)
+            x = hk.LayerNorm(-1, True, True)(x)
+            x = y + x
+            y = x
+            x = FeedForward(self.dim, self.mlp_dim, self.dropout)(x, is_training)
+            x = hk.LayerNorm(-1, True, True)(x)
+            x = y + x
+        return x
+    
