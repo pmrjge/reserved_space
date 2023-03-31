@@ -152,3 +152,55 @@ class Transformer(hk.Module):
             x = y + x
         return x
     
+
+class CvT(hk.Module):
+    def __init__(self, image_size, in_channels, num_classes, dim=64, kernels=(7, 3, 3), strides=(4, 2, 1), heads=(1, 3, 6), depth=(1, 2, 10), dropout=0.6, emb_dropout=0.5, scale_dim=4):
+        self.dim = dim
+        self.kernels = kernels
+        self.image_size = image_size
+        self.depth = depth
+        self.num_classes = num_classes
+        self.strides = strides
+        self.heads = heads
+        self.dropout = dropout
+        self.emb_dropout = emb_dropout
+        self.scale_dim = scale_dim
+
+    def __call__(self, x, is_training: bool = True):
+        # Stage 1
+        image_size = self.image_size
+        x = hk.Conv2D(self.dim, self.kernels[0], self.strides[0], 1, 'SAME')(x)
+        x = eo.rearrange(x, 'b h w c -> b (h w) c', h=self.image_size//4, w=self.image_size//4)
+        x = hk.LayerNorm(-1, True, True)(x)
+        x = Transformer(dim=self.dim, img_size=self.image_size//4, depth=self.depth[0], heads=self.heads[0], dim_head=self.dim, mlp_dim = self.dim * self.scale_dim, dropout=self.dropout)(x, is_training)
+        x = eo.rearrange(x, 'b (h w) c -> b h w c', h = image_size // 4, w = image_size // 4)
+
+        # Stage 2
+        heads = self.heads
+        scale = heads[1] / heads[0]
+        dim = scale * self.dim
+        x = hk.Conv2D(dim, self.kernels[1], self.strides[1], 1, 'SAME')(x)
+        x = eo.rearrange(x, 'b h w c-> b (h w) c', h = image_size //8, w = image_size//8)
+        x = hk.LayerNorm(-1, True, True)(x)
+        x = Transformer(dim=dim, img_size=self.image_size//8, depth=self.depth[1], heads=self.heads[1], dim_head=self.dim, mlp_dim=dim * self.scale_dim, dropout=self.dropout)(x, is_training)
+        x = eo.rearrange(x, 'b (h w) c -> b h w c', h = image_size // 8, w = image_size // 8)
+
+        # Stage 3
+        scale = heads[2] // heads[1]
+        dim = scale * dim
+        x = hk.Conv2D(dim, self.kernels[2], self.strides[2], 1, 'SAME')(x)
+        x = eo.rearrange(x, 'b h w c-> b (h w) c', h = image_size//8, w = image_size//8)
+        x = hk.LayerNorm(-1, True, True)(x)
+
+        b, n, _ = x.shape
+        cls_token = hk.get_parameter("cls_token", shape=(1, 1, dim), init=hki.VarianceScaling())
+        cls_tokens = eo.repeat(cls_token, '() n d -> b n d', b = b)
+        xs = jnp.concatenate((cls_tokens, x), axis=1)
+        xs = Transformer(dim=dim, img_size=image_size//8, depth=self.depth[2], heads=self.heads[2], dim_head=self.dim, mlp_dim=dim * self.scale_dim, dropout=self.dropout, last_stage=True)(xs, is_training)
+        x = xs[:, 0]
+
+        x = hk.LayerNorm(-1, True, True)(x)
+        x = hk.Linear(self.num_classes, w_init=hki.VarianceScaling())(x)
+        return x
+
+        
