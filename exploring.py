@@ -154,7 +154,7 @@ class Transformer(hk.Module):
     
 
 class CvT(hk.Module):
-    def __init__(self, image_size, in_channels, num_classes, dim=64, kernels=(7, 3, 3), strides=(4, 2, 1), heads=(1, 3, 6), depth=(1, 2, 10), dropout=0.6, emb_dropout=0.5, scale_dim=4):
+    def __init__(self, image_size, num_classes, dim=64, kernels=(7, 3, 3), strides=(2, 2, 1), heads=(1, 3, 6), depth=(1, 2, 10), dropout=0.6, emb_dropout=0.5, scale_dim=4):
         self.dim = dim
         self.kernels = kernels
         self.image_size = image_size
@@ -170,37 +170,68 @@ class CvT(hk.Module):
         # Stage 1
         image_size = self.image_size
         x = hk.Conv2D(self.dim, self.kernels[0], self.strides[0], 1, 'SAME')(x)
-        x = eo.rearrange(x, 'b h w c -> b (h w) c', h=self.image_size//4, w=self.image_size//4)
+        x = eo.rearrange(x, 'b h w c -> b (h w) c', h=self.image_size//2, w=self.image_size//2)
         x = hk.LayerNorm(-1, True, True)(x)
-        x = Transformer(dim=self.dim, img_size=self.image_size//4, depth=self.depth[0], heads=self.heads[0], dim_head=self.dim, mlp_dim = self.dim * self.scale_dim, dropout=self.dropout)(x, is_training)
-        x = eo.rearrange(x, 'b (h w) c -> b h w c', h = image_size // 4, w = image_size // 4)
+        x = Transformer(dim=self.dim, img_size=self.image_size//2, depth=self.depth[0], heads=self.heads[0], dim_head=self.dim, mlp_dim = self.dim * self.scale_dim, dropout=self.dropout)(x, is_training)
+        x = eo.rearrange(x, 'b (h w) c -> b h w c', h = image_size // 2, w = image_size // 2)
 
         # Stage 2
         heads = self.heads
         scale = heads[1] / heads[0]
         dim = scale * self.dim
         x = hk.Conv2D(dim, self.kernels[1], self.strides[1], 1, 'SAME')(x)
-        x = eo.rearrange(x, 'b h w c-> b (h w) c', h = image_size //8, w = image_size//8)
+        x = eo.rearrange(x, 'b h w c-> b (h w) c', h = image_size //4, w = image_size//4)
         x = hk.LayerNorm(-1, True, True)(x)
-        x = Transformer(dim=dim, img_size=self.image_size//8, depth=self.depth[1], heads=self.heads[1], dim_head=self.dim, mlp_dim=dim * self.scale_dim, dropout=self.dropout)(x, is_training)
-        x = eo.rearrange(x, 'b (h w) c -> b h w c', h = image_size // 8, w = image_size // 8)
+        x = Transformer(dim=dim, img_size=self.image_size//4, depth=self.depth[1], heads=self.heads[1], dim_head=self.dim, mlp_dim=dim * self.scale_dim, dropout=self.dropout)(x, is_training)
+        x = eo.rearrange(x, 'b (h w) c -> b h w c', h = image_size // 4, w = image_size // 4)
 
         # Stage 3
         scale = heads[2] // heads[1]
         dim = scale * dim
         x = hk.Conv2D(dim, self.kernels[2], self.strides[2], 1, 'SAME')(x)
-        x = eo.rearrange(x, 'b h w c-> b (h w) c', h = image_size//8, w = image_size//8)
+        x = eo.rearrange(x, 'b h w c-> b (h w) c', h = image_size//4, w = image_size//4)
         x = hk.LayerNorm(-1, True, True)(x)
 
         b, n, _ = x.shape
         cls_token = hk.get_parameter("cls_token", shape=(1, 1, dim), init=hki.VarianceScaling())
         cls_tokens = eo.repeat(cls_token, '() n d -> b n d', b = b)
         xs = jnp.concatenate((cls_tokens, x), axis=1)
-        xs = Transformer(dim=dim, img_size=image_size//8, depth=self.depth[2], heads=self.heads[2], dim_head=self.dim, mlp_dim=dim * self.scale_dim, dropout=self.dropout, last_stage=True)(xs, is_training)
+        xs = Transformer(dim=dim, img_size=image_size//4, depth=self.depth[2], heads=self.heads[2], dim_head=self.dim, mlp_dim=dim * self.scale_dim, dropout=self.dropout, last_stage=True)(xs, is_training)
         x = xs[:, 0]
 
         x = hk.LayerNorm(-1, True, True)(x)
         x = hk.Linear(self.num_classes, w_init=hki.VarianceScaling())(x)
         return x
 
-        
+
+def process_epoch_gen(a, b, batch_size, num_devices):
+    topo = batch_size // num_devices
+
+    def epoch_generator(rng):
+        n = a.shape[0]
+        num_batches = n // batch_size
+        key, rng = jrnd.split(rng)
+
+        perm = jrnd.permutation(key, n)
+        for i in range(num_batches):
+            i0 = i * batch_size
+            i1 = (i+1) * batch_size
+
+            subp = perm[i0:i1]
+
+            outx = jnp.array(a[subp], dtype=jnp.float32)
+            outy = jnp.array(b[subp], dtype=jnp.int32)
+            yield outx.reshape(num_devices, topo, *outx.shape[1:]), outy.reshape(num_devices, topo, *outy.shape[1:])
+
+    return epoch_generator
+
+
+batch_size = 8
+
+process_gen = process_epoch_gen(X, y, batch_size, num_devices=device_count)
+
+def build_forward_fn(image_size=28):
+    def forward_fn(dgt: jnp.ndarray, *, is_training: bool) -> jnp.ndarray:
+        return CvT(image_size=image_size, num_classes=10)(dgt, is_training=is_training)
+    return forward_fn
+
